@@ -1,0 +1,233 @@
+Практическая работа 8. Код для терминала Linux.
+Файл в кодировке UTF-8.
+
+Как вставить:
+1. Перейди в папку, где будут лежать программы.
+2. Скопируй блок от cat до EOF включительно и вставь в терминал.
+3. То же самое для client.c и killer.c.
+4. Затем команды сборки. Сервер запускай в одном терминале и не закрывай его. Клиент и киллер — в другом.
+
+Отличие от картинки в методичке:
+в методичке нарисован обмен по TCP-сокету. У сокета нет типа сообщения, поэтому требования про киллера и политику выборки с порогом на том примере не выполняются. Ниже очереди сообщений System V.
+
+Ключ очереди: 24680.
+Тип запроса клиента: 1.
+Тип сообщения киллера: 2.
+Ответ сервера имеет тип, равный pid клиента.
+
+Число вводи точкой: 2.5
+В программах включена локаль "C", поэтому запятая не нужна.
+
+Если сервер пишет, что уже запущен, а старого процесса нет, сначала выполни последний блок: очередь осталась после Ctrl+C.
+
+========== server.c ==========
+
+cat > server.c << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <locale.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+
+#define MSG_KEY 24680
+#define TYPE_REQUEST 1
+#define TYPE_KILL 2
+
+struct message {
+    long mtype;
+    int pid;
+    float value;
+};
+
+int main(void) {
+    struct message msg;
+    int msqid;
+
+    setlocale(LC_NUMERIC, "C");
+
+    /* IPC_EXCL: второй сервер не создаст очередь, пока жива первая */
+    msqid = msgget(MSG_KEY, IPC_CREAT | IPC_EXCL | 0666);
+    if (msqid == -1) {
+        if (errno == EEXIST) {
+            fprintf(stderr, "Сервер уже запущен.\n");
+        } else {
+            perror("Ошибка создания очереди");
+        }
+        return 1;
+    }
+
+    printf("Сервер запущен. Ожидание сообщений.\n");
+
+    for (;;) {
+        /* тип -2: политика выборки с порогом, берутся типы 1 и 2 */
+        if (msgrcv(msqid, &msg, sizeof(msg) - sizeof(long), -TYPE_KILL, 0) == -1) {
+            perror("Ошибка приёма сообщения");
+            break;
+        }
+
+        if (msg.mtype == TYPE_KILL) {
+            printf("Получено сообщение киллера. Завершение работы.\n");
+            break;
+        }
+
+        float result = msg.value * msg.value;
+        printf("Получено число %.2f от процесса %d. Результат %.2f отправлен клиенту.\n",
+               msg.value, msg.pid, result);
+
+        msg.mtype = msg.pid;
+        msg.value = result;
+
+        if (msgsnd(msqid, &msg, sizeof(msg) - sizeof(long), 0) == -1) {
+            perror("Ошибка отправки ответа");
+            break;
+        }
+    }
+
+    if (msgctl(msqid, IPC_RMID, NULL) == -1) {
+        perror("Ошибка удаления очереди");
+        return 1;
+    }
+
+    printf("Очередь удалена.\n");
+    return 0;
+}
+EOF
+
+========== client.c ==========
+
+cat > client.c << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <locale.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+
+#define MSG_KEY 24680
+#define TYPE_REQUEST 1
+
+struct message {
+    long mtype;
+    int pid;
+    float value;
+};
+
+int main(void) {
+    struct message msg;
+    int msqid;
+    float number;
+    long reply_type;
+
+    setlocale(LC_NUMERIC, "C");
+
+    msqid = msgget(MSG_KEY, 0666);
+    if (msqid == -1) {
+        perror("Ошибка подключения к очереди");
+        return 1;
+    }
+
+    printf("Введите число с плавающей точкой: ");
+    if (scanf("%f", &number) != 1) {
+        fprintf(stderr, "Ошибка ввода числа.\n");
+        return 1;
+    }
+
+    msg.mtype = TYPE_REQUEST;
+    msg.pid = (int)getpid();
+    msg.value = number;
+    reply_type = msg.pid;
+
+    if (msgsnd(msqid, &msg, sizeof(msg) - sizeof(long), 0) == -1) {
+        perror("Ошибка отправки сообщения");
+        return 1;
+    }
+
+    printf("Число отправлено серверу.\n");
+
+    if (msgrcv(msqid, &msg, sizeof(msg) - sizeof(long), reply_type, 0) == -1) {
+        perror("Ошибка приёма ответа");
+        return 1;
+    }
+
+    printf("Результат от сервера: %.2f\n", msg.value);
+    return 0;
+}
+EOF
+
+========== killer.c ==========
+
+cat > killer.c << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+
+#define MSG_KEY 24680
+#define TYPE_KILL 2
+
+struct message {
+    long mtype;
+    int pid;
+    float value;
+};
+
+int main(void) {
+    struct message msg;
+    int msqid;
+
+    msqid = msgget(MSG_KEY, 0666);
+    if (msqid == -1) {
+        perror("Ошибка подключения к очереди");
+        return 1;
+    }
+
+    msg.mtype = TYPE_KILL;
+    msg.pid = (int)getpid();
+    msg.value = 0;
+
+    if (msgsnd(msqid, &msg, sizeof(msg) - sizeof(long), 0) == -1) {
+        perror("Ошибка отправки сообщения");
+        return 1;
+    }
+
+    printf("Сообщение киллера отправлено.\n");
+    return 0;
+}
+EOF
+
+========== сборка ==========
+
+gcc server.c -o server
+gcc client.c -o client
+gcc killer.c -o killer
+
+========== запуск ==========
+
+Терминал 1:
+./server
+
+Терминал 2:
+./client
+2.5
+
+Пока сервер работает, в третьем терминале или в том же втором:
+./server
+
+Должно напечатать: Сервер уже запущен.
+
+Затем в терминале клиента:
+./killer
+
+Сервер в первом терминале завершится и удалит очередь.
+После этого новый сервер снова запускается:
+./server
+
+========== если очередь осталась после Ctrl+C ==========
+
+ipcs -q
+ipcrm -Q 24680

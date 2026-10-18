@@ -1,0 +1,206 @@
+Практическая работа 7. Код для терминала Linux.
+Файл в кодировке UTF-8.
+
+Как вставить:
+1. Перейди в папку, где будут лежать программы.
+2. Скопируй блок от cat до EOF включительно и вставь в терминал.
+3. То же самое для reader.c.
+4. Затем команды сборки и запуска. Сначала writer, потом reader.
+
+Два отличия от картинки в методичке:
+- сегмент на 1 байт больше файла, в конец пишется '\0', иначе printf у читателя выйдет за границу памяти;
+- читатель в конце удаляет семафор (semctl IPC_RMID). В методичке этого нет, без удаления семафор остаётся в системе.
+
+Если писатель ругается, что сегмент или семафор уже есть и размер не совпадает,
+сначала выполни блок «очистка».
+
+========== writer.c ==========
+
+cat > writer.c << 'EOF'
+// writer.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/shm.h>
+#include <sys/stat.h>
+#include <sys/sem.h>
+
+#define SHM_KEY 12345
+#define SEM_KEY 54321
+#define BUFFER_SIZE 1024
+
+void semaphore_wait(int sem_id) {
+    struct sembuf sb = {0, -1, 0};
+    if (semop(sem_id, &sb, 1) == -1) {
+        perror("Ошибка ожидания семафора");
+        exit(1);
+    }
+}
+
+void semaphore_signal(int sem_id) {
+    struct sembuf sb = {0, 1, 0};
+    if (semop(sem_id, &sb, 1) == -1) {
+        perror("Ошибка сигнала семафора");
+        exit(1);
+    }
+}
+
+int main(void) {
+    int fd;
+    char buffer[BUFFER_SIZE];
+    struct stat file_stat;
+
+    fd = open("writer.c", O_RDONLY);
+    if (fd == -1) {
+        perror("Ошибка открытия файла");
+        exit(1);
+    }
+
+    if (fstat(fd, &file_stat) == -1) {
+        perror("Ошибка получения информации о файле");
+        close(fd);
+        exit(1);
+    }
+
+    /* +1 байт под завершающий '\0': читатель печатает память как строку */
+    int shm_id = shmget(SHM_KEY, file_stat.st_size + 1, IPC_CREAT | 0666);
+    if (shm_id == -1) {
+        perror("Ошибка создания сегмента разделяемой памяти");
+        close(fd);
+        exit(1);
+    }
+
+    int sem_id = semget(SEM_KEY, 1, IPC_CREAT | 0666);
+    if (sem_id == -1) {
+        perror("Ошибка создания семафора");
+        close(fd);
+        exit(1);
+    }
+
+    if (semctl(sem_id, 0, SETVAL, 1) == -1) {
+        perror("Ошибка инициализации семафора");
+        close(fd);
+        exit(1);
+    }
+
+    char *shm_ptr = shmat(shm_id, NULL, 0);
+    if (shm_ptr == (char *)-1) {
+        perror("Ошибка подключения сегмента разделяемой памяти");
+        close(fd);
+        exit(1);
+    }
+
+    semaphore_wait(sem_id);
+
+    ssize_t bytes_read;
+    char *write_ptr = shm_ptr;
+    while ((bytes_read = read(fd, buffer, BUFFER_SIZE)) > 0) {
+        memcpy(write_ptr, buffer, bytes_read);
+        write_ptr += bytes_read;
+    }
+
+    if (bytes_read == -1) {
+        perror("Ошибка чтения файла");
+        semaphore_signal(sem_id);
+        close(fd);
+        exit(1);
+    }
+
+    *write_ptr = '\0';
+    semaphore_signal(sem_id);
+    close(fd);
+
+    printf("Файл скопирован в разделяемую память.\n");
+    return 0;
+}
+EOF
+
+========== reader.c ==========
+
+cat > reader.c << 'EOF'
+// reader.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/shm.h>
+#include <sys/sem.h>
+#include <unistd.h>
+
+#define SHM_KEY 12345
+#define SEM_KEY 54321
+
+void semaphore_wait(int sem_id) {
+    struct sembuf sb = {0, -1, 0};
+    if (semop(sem_id, &sb, 1) == -1) {
+        perror("Ошибка ожидания семафора");
+        exit(1);
+    }
+}
+
+void semaphore_signal(int sem_id) {
+    struct sembuf sb = {0, 1, 0};
+    if (semop(sem_id, &sb, 1) == -1) {
+        perror("Ошибка сигнала семафора");
+        exit(1);
+    }
+}
+
+int main(void) {
+    int shm_id = shmget(SHM_KEY, 0, 0666);
+    if (shm_id == -1) {
+        perror("Ошибка подключения к сегменту разделяемой памяти");
+        exit(1);
+    }
+
+    int sem_id = semget(SEM_KEY, 1, 0666);
+    if (sem_id == -1) {
+        perror("Ошибка подключения к семафору");
+        exit(1);
+    }
+
+    char *shm_ptr = shmat(shm_id, NULL, 0);
+    if (shm_ptr == (char *)-1) {
+        perror("Ошибка подключения сегмента разделяемой памяти");
+        exit(1);
+    }
+
+    semaphore_wait(sem_id);
+
+    printf("Содержимое разделяемой памяти:\n%s\n", shm_ptr);
+
+    semaphore_signal(sem_id);
+
+    if (shmdt(shm_ptr) == -1) {
+        perror("Ошибка отключения сегмента разделяемой памяти");
+        exit(1);
+    }
+
+    if (shmctl(shm_id, IPC_RMID, NULL) == -1) {
+        perror("Ошибка удаления сегмента разделяемой памяти");
+        exit(1);
+    }
+
+    if (semctl(sem_id, 0, IPC_RMID) == -1) {
+        perror("Ошибка удаления семафора");
+        exit(1);
+    }
+
+    printf("Сегмент разделяемой памяти и семафор удалены.\n");
+    return 0;
+}
+EOF
+
+========== сборка и запуск ==========
+
+gcc writer.c -o writer
+gcc reader.c -o reader
+./writer
+./reader
+
+========== если остались старые объекты ==========
+
+ipcs -m
+ipcs -s
+ipcrm -M 12345
+ipcrm -S 54321

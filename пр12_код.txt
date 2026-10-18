@@ -1,0 +1,186 @@
+Практическая работа 12. Код для терминала Linux.
+Файл в кодировке UTF-8.
+
+Как вставить:
+1. Перейди в пустую папку, где будут лежать программы.
+2. Скопируй блок от cat до EOF включительно и вставь в терминал.
+3. То же самое для signals_mod.c.
+4. Затем команды сборки. Сначала проверяется signals, потом signals_mod.
+5. Программу не останавливай Ctrl+Z. SIGINT (Ctrl+C) она перехватывает и не завершается.
+   Завершение — сигнал SIGTERM из второго терминала.
+
+Два отличия модернизации от картинки в методичке:
+- обработчик ставится через sigaction, а не signal;
+- добавлен SIGUSR1 (только запись в журнал) и по SIGHUP основная работа
+  перезапускается: в консоль печатается «Основная работа перезапущена.».
+
+Журнал один и тот же: log.txt. Перед вторым прогоном его лучше убрать,
+чтобы записи двух программ не смешались.
+
+========== signals.c ==========
+
+cat > signals.c << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <unistd.h>
+#include <time.h>
+
+FILE *log_file;
+
+void write_log(const char *message) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    log_file = fopen("log.txt", "a");
+    if (log_file == NULL) {
+        perror("Не удалось открыть файл журнала");
+        exit(EXIT_FAILURE);
+    }
+    fprintf(log_file, "%s в %02d:%02d:%02d\n", message, t->tm_hour, t->tm_min, t->tm_sec);
+    fclose(log_file);
+}
+
+void handle_signal(int signum) {
+    if (signum == SIGINT) {
+        write_log("Получен сигнал SIGINT");
+    } else if (signum == SIGTERM) {
+        write_log("Получен сигнал SIGTERM. Завершение работы");
+        exit(0);
+    } else if (signum == SIGHUP) {
+        write_log("Получен сигнал SIGHUP. Перезапуск");
+        /* дополнительные действия по перезапуску можно добавить здесь */
+    }
+}
+
+int main(void) {
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+    signal(SIGHUP, handle_signal);
+
+    while (1) {
+        printf("Программа работает...\n");
+        sleep(5);
+    }
+
+    return 0;
+}
+EOF
+
+========== signals_mod.c ==========
+
+cat > signals_mod.c << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <unistd.h>
+#include <time.h>
+
+volatile sig_atomic_t restart_requested = 0;
+
+void write_log(const char *message) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    FILE *log_file = fopen("log.txt", "a");
+    if (log_file == NULL) {
+        perror("Не удалось открыть файл журнала");
+        exit(EXIT_FAILURE);
+    }
+    fprintf(log_file, "%s в %02d:%02d:%02d\n", message, t->tm_hour, t->tm_min, t->tm_sec);
+    fclose(log_file);
+}
+
+void handle_signal(int signum) {
+    if (signum == SIGINT) {
+        write_log("Получен сигнал SIGINT");
+    } else if (signum == SIGTERM) {
+        write_log("Получен сигнал SIGTERM. Завершение работы");
+        exit(0);
+    } else if (signum == SIGHUP) {
+        write_log("Получен сигнал SIGHUP. Перезапуск");
+        restart_requested = 1;
+    } else if (signum == SIGUSR1) {
+        write_log("Получен сигнал SIGUSR1");
+    }
+}
+
+static void install_handler(int signo) {
+    struct sigaction sa;
+
+    sa.sa_handler = handle_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    if (sigaction(signo, &sa, NULL) == -1) {
+        perror("sigaction");
+        exit(EXIT_FAILURE);
+    }
+}
+
+int main(void) {
+    install_handler(SIGINT);
+    install_handler(SIGTERM);
+    install_handler(SIGHUP);
+    install_handler(SIGUSR1);
+
+    printf("PID: %d\n", (int)getpid());
+    fflush(stdout);
+
+    while (1) {
+        if (restart_requested) {
+            restart_requested = 0;
+            printf("Основная работа перезапущена.\n");
+            fflush(stdout);
+        }
+        printf("Программа работает...\n");
+        fflush(stdout);
+        sleep(5);
+    }
+
+    return 0;
+}
+EOF
+
+========== сборка ==========
+
+gcc signals.c -o signals
+gcc signals_mod.c -o signals_mod
+
+========== проверка signals ==========
+
+# терминал 1
+./signals
+
+# терминал 2, PID смотри в выводе ps
+ps -ef | grep '[s]ignals'
+kill -INT <PID>
+kill -HUP <PID>
+kill -TERM <PID>
+
+# журнал
+cat log.txt
+
+Ожидаемые строки журнала (время будет текущим):
+Получен сигнал SIGINT в ЧЧ:ММ:СС
+Получен сигнал SIGHUP. Перезапуск в ЧЧ:ММ:СС
+Получен сигнал SIGTERM. Завершение работы в ЧЧ:ММ:СС
+
+После SIGINT и SIGHUP в первом терминале строка «Программа работает...»
+продолжает печататься каждые 5 секунд. После SIGTERM процесс завершается.
+
+========== проверка signals_mod ==========
+
+rm -f log.txt
+
+# терминал 1
+./signals_mod
+
+# терминал 2, PID программа печатает сама в первой строке
+kill -INT <PID>
+kill -HUP <PID>
+kill -USR1 <PID>
+kill -TERM <PID>
+
+cat log.txt
+
+После SIGHUP в первом терминале появляется строка
+«Основная работа перезапущена.», затем снова «Программа работает...».
+SIGUSR1 процесс не останавливает, в журнал добавляется строка про SIGUSR1.

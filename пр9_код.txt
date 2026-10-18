@@ -1,0 +1,127 @@
+Практическая работа 9. Код для терминала Linux.
+Файл в кодировке UTF-8.
+
+Как вставить:
+1. Перейди в папку, где будет лежать программа.
+2. Скопируй блок от cat до EOF включительно и вставь в терминал.
+3. Затем команды сборки и запуска.
+
+Отличие от картинки в методичке:
+в примере оба цикла бесконечные (while (1)), pthread_join их не дождётся.
+Здесь производитель кладёт 20 чисел и ставит флаг finished.
+Потребитель выходит, когда буфер пуст и производитель закончил.
+Так программа сама завершается, мьютекс и условные переменные удаляются.
+
+В тексте задания написано, что производителя уведомляют, что «буфер не пуст».
+В примере кода переменная называется not_full: производитель ждёт, когда буфер полон.
+
+========== producer_consumer.c ==========
+
+cat > producer_consumer.c << 'EOF'
+#include <stdio.h>
+#include <pthread.h>
+#include <unistd.h>
+
+#define BUFFER_SIZE 10
+#define ITEM_COUNT 20
+
+typedef struct {
+    int buffer[BUFFER_SIZE];
+    int in;  /* индекс следующей записи */
+    int out; /* индекс следующего чтения */
+} RingBuffer;
+
+RingBuffer buffer;
+pthread_mutex_t mutex;
+pthread_cond_t not_full;
+pthread_cond_t not_empty;
+int finished = 0;
+
+int produce_item(int n) {
+    return n;
+}
+
+void consume_item(int item) {
+    printf("Потребитель обработал: %d\n", item);
+}
+
+void *producer(void *arg) {
+    (void)arg;
+
+    for (int n = 1; n <= ITEM_COUNT; n++) {
+        int item = produce_item(n);
+
+        pthread_mutex_lock(&mutex);
+        /* одна ячейка остаётся свободной, чтобы отличить полный буфер от пустого */
+        while ((buffer.in + 1) % BUFFER_SIZE == buffer.out) {
+            pthread_cond_wait(&not_full, &mutex);
+        }
+        buffer.buffer[buffer.in] = item;
+        buffer.in = (buffer.in + 1) % BUFFER_SIZE;
+        pthread_cond_signal(&not_empty);
+        pthread_mutex_unlock(&mutex);
+
+        printf("Производитель добавил: %d\n", item);
+        usleep(50000);
+    }
+
+    pthread_mutex_lock(&mutex);
+    finished = 1;
+    pthread_cond_signal(&not_empty);
+    pthread_mutex_unlock(&mutex);
+    return NULL;
+}
+
+void *consumer(void *arg) {
+    (void)arg;
+
+    while (1) {
+        pthread_mutex_lock(&mutex);
+        while (buffer.in == buffer.out && !finished) {
+            pthread_cond_wait(&not_empty, &mutex);
+        }
+        if (buffer.in == buffer.out && finished) {
+            pthread_mutex_unlock(&mutex);
+            break;
+        }
+
+        int item = buffer.buffer[buffer.out];
+        buffer.out = (buffer.out + 1) % BUFFER_SIZE;
+        pthread_cond_signal(&not_full);
+        pthread_mutex_unlock(&mutex);
+
+        consume_item(item);
+        usleep(80000);
+    }
+    return NULL;
+}
+
+int main(void) {
+    pthread_t producer_thread, consumer_thread;
+
+    buffer.in = 0;
+    buffer.out = 0;
+
+    pthread_mutex_init(&mutex, NULL);
+    pthread_cond_init(&not_full, NULL);
+    pthread_cond_init(&not_empty, NULL);
+
+    pthread_create(&producer_thread, NULL, producer, NULL);
+    pthread_create(&consumer_thread, NULL, consumer, NULL);
+
+    pthread_join(producer_thread, NULL);
+    pthread_join(consumer_thread, NULL);
+
+    pthread_mutex_destroy(&mutex);
+    pthread_cond_destroy(&not_full);
+    pthread_cond_destroy(&not_empty);
+
+    printf("Программа завершена. Обработано элементов: %d\n", ITEM_COUNT);
+    return 0;
+}
+EOF
+
+========== сборка и запуск ==========
+
+gcc producer_consumer.c -o producer_consumer -pthread
+./producer_consumer

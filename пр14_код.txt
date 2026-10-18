@@ -1,0 +1,221 @@
+Практическая работа 14. Код для терминала Linux.
+Файл в кодировке UTF-8.
+
+Как вставить:
+1. Перейди в пустую папку.
+2. Скопируй блок от cat до EOF включительно и вставь в терминал.
+3. То же самое для packet_sniffer_mod.c.
+4. Установи библиотеку и собери программы.
+5. Захват требует sudo. Имя интерфейса возьми из ip -br a, не lo:
+   у lo нет Ethernet-заголовка, а пример методички разбирает именно его.
+
+Пока программа ждёт пакеты, во втором терминале создай трафик.
+Для packet_sniffer подойдёт ping. Для фильтра tcp — curl.
+Для фильтра udp — getent hosts.
+
+Два отличия модернизации от картинки в методичке:
+- интерфейс, число пакетов и фильтр tcp или udp задаются аргументами;
+- те же строки пишутся в capture.log. Адреса копируются через inet_ntop
+  в два разных массива: у inet_ntoa один общий буфер.
+
+========== установка ==========
+
+sudo apt-get update
+sudo apt-get install -y libpcap-dev
+
+========== packet_sniffer.c ==========
+
+cat > packet_sniffer.c << 'EOF'
+#include <stdio.h>
+#include <pcap.h>
+#include <arpa/inet.h>
+#include <netinet/ip.h>
+#include <netinet/if_ether.h>
+
+void packet_handler(u_char *args, const struct pcap_pkthdr *header, const u_char *packet) {
+    struct ether_header *eth_header = (struct ether_header *) packet;
+    if (ntohs(eth_header->ether_type) == ETHERTYPE_IP) {
+        struct ip *ip_header = (struct ip *)(packet + sizeof(struct ether_header));
+
+        printf("Captured a packet:\n");
+        printf("Source IP: %s\n", inet_ntoa(ip_header->ip_src));
+        printf("Destination IP: %s\n", inet_ntoa(ip_header->ip_dst));
+        printf("Packet size: %d bytes\n", header->len);
+    }
+}
+
+int main(void) {
+    char *dev, errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t *handle;
+
+    /* Поиск устройства для захвата */
+    dev = pcap_lookupdev(errbuf);
+    if (dev == NULL) {
+        fprintf(stderr, "Couldn't find default device: %s\n", errbuf);
+        return 2;
+    }
+
+    /* Открытие устройства для захвата */
+    handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
+    if (handle == NULL) {
+        fprintf(stderr, "Couldn't open device %s: %s\n", dev, errbuf);
+        return 2;
+    }
+
+    /* Захват 10 пакетов */
+    pcap_loop(handle, 10, packet_handler, NULL);
+
+    /* Закрытие захвата */
+    pcap_close(handle);
+
+    return 0;
+}
+EOF
+
+========== packet_sniffer_mod.c ==========
+
+cat > packet_sniffer_mod.c << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pcap.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/if_ether.h>
+
+struct capture_ctx {
+    FILE *out;
+};
+
+static const char *proto_name(unsigned proto) {
+    if (proto == IPPROTO_TCP) return "TCP";
+    if (proto == IPPROTO_UDP) return "UDP";
+    return "IP";
+}
+
+void packet_handler(u_char *args, const struct pcap_pkthdr *header, const u_char *packet) {
+    struct capture_ctx *ctx = (struct capture_ctx *) args;
+    struct ether_header *eth_header = (struct ether_header *) packet;
+
+    if (ntohs(eth_header->ether_type) != ETHERTYPE_IP)
+        return;
+
+    struct ip *ip_header = (struct ip *)(packet + sizeof(struct ether_header));
+    char src[INET_ADDRSTRLEN];
+    char dst[INET_ADDRSTRLEN];
+
+    inet_ntop(AF_INET, &ip_header->ip_src, src, sizeof src);
+    inet_ntop(AF_INET, &ip_header->ip_dst, dst, sizeof dst);
+
+    char line[256];
+    snprintf(line, sizeof line,
+             "Captured a packet:\nProtocol: %s\nSource IP: %s\nDestination IP: %s\nPacket size: %u bytes\n",
+             proto_name(ip_header->ip_p), src, dst, header->len);
+    fputs(line, stdout);
+    fputs(line, ctx->out);
+    fflush(ctx->out);
+}
+
+int main(int argc, char **argv) {
+    if (argc != 4) {
+        fprintf(stderr, "Использование: %s <интерфейс> <число> <tcp|udp>\n", argv[0]);
+        return 1;
+    }
+
+    char *dev = argv[1];
+    int count = atoi(argv[2]);
+    const char *filter = argv[3];
+
+    if (count <= 0) {
+        fprintf(stderr, "Число пакетов должно быть больше нуля\n");
+        return 1;
+    }
+    if (strcmp(filter, "tcp") != 0 && strcmp(filter, "udp") != 0) {
+        fprintf(stderr, "Фильтр: tcp или udp\n");
+        return 1;
+    }
+
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t *handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
+    if (handle == NULL) {
+        fprintf(stderr, "Couldn't open device %s: %s\n", dev, errbuf);
+        return 2;
+    }
+
+    if (pcap_datalink(handle) != DLT_EN10MB) {
+        fprintf(stderr, "Нужен Ethernet-интерфейс, не lo. Имя смотри в выводе ip -br a.\n");
+        pcap_close(handle);
+        return 2;
+    }
+
+    struct bpf_program fp;
+    if (pcap_compile(handle, &fp, filter, 0, 0) == -1) {
+        fprintf(stderr, "pcap_compile: %s\n", pcap_geterr(handle));
+        pcap_close(handle);
+        return 2;
+    }
+    if (pcap_setfilter(handle, &fp) == -1) {
+        fprintf(stderr, "pcap_setfilter: %s\n", pcap_geterr(handle));
+        pcap_freecode(&fp);
+        pcap_close(handle);
+        return 2;
+    }
+    pcap_freecode(&fp);
+
+    FILE *out = fopen("capture.log", "w");
+    if (out == NULL) {
+        perror("capture.log");
+        pcap_close(handle);
+        return 2;
+    }
+
+    printf("Interface: %s, packets: %d, filter: %s\n", dev, count, filter);
+
+    struct capture_ctx ctx;
+    ctx.out = out;
+    pcap_loop(handle, count, packet_handler, (u_char *) &ctx);
+
+    fclose(out);
+    pcap_close(handle);
+    return 0;
+}
+EOF
+
+========== сборка ==========
+
+gcc -o packet_sniffer packet_sniffer.c -lpcap
+gcc -o packet_sniffer_mod packet_sniffer_mod.c -lpcap
+
+========== проверка packet_sniffer ==========
+
+ip -br a
+
+# терминал 1. Если lookupdev не нашёл устройство, переходи к второй программе
+# и укажи интерфейс сам.
+sudo ./packet_sniffer
+
+# терминал 2, пока первая программа ждёт
+ping -c 4 8.8.8.8
+
+========== проверка packet_sniffer_mod ==========
+
+# подставь интерфейс с адресом, не lo
+IF=eth0
+
+# терминал 1
+sudo ./packet_sniffer_mod "$IF" 5 tcp
+
+# терминал 2
+curl -I http://example.com
+
+# журнал
+cat capture.log
+
+# ещё один прогон, уже UDP
+sudo ./packet_sniffer_mod "$IF" 5 udp
+
+# терминал 2
+getent hosts example.com
+
+cat capture.log

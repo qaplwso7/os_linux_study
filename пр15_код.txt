@@ -1,0 +1,580 @@
+Практическая работа 15. Код для терминала Linux.
+Файл в кодировке UTF-8.
+
+Как вставить:
+1. Перейди в пустую папку.
+2. Вставь четыре блока от cat до EOF: server.c, client.c, server_mod.c, client_mod.c.
+3. Собери все четыре программы.
+4. Сначала пара из методички: сервер в одном терминале, клиент в другом.
+5. Потом модернизированная пара. Сервер слушает порт 8080 и по IPv6, и по IPv4.
+   Клиенту можно передать 127.0.0.1 или ::1.
+
+Отличия модернизации от картинки в методичке:
+- на каждого клиента создаётся отдельный поток pthread;
+- клиент шлёт несколько строк, сеанс кончается командой exit;
+- команда --file передаёт файл, сервер сохраняет его как recv_<имя>;
+- адрес разбирается через getaddrinfo, поэтому подходят и IPv4, и IPv6;
+- SO_REUSEADDR и отключение IPV6_V6ONLY ставятся отдельными вызовами setsockopt.
+
+Порт один и тот же, 8080. Два сервера одновременно не запускай.
+
+========== server.c ==========
+
+cat > server.c << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+
+#define PORT 8080
+#define BUFFER_SIZE 1024
+
+int main(void) {
+    int server_fd, new_socket;
+    struct sockaddr_in address;
+    int opt = 1;
+    int addrlen = sizeof(address);
+    char buffer[BUFFER_SIZE] = {0};
+    char *response = "Hello from server";
+
+    /* Создание серверного сокета */
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        perror("socket failed");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Привязка сокета к порту */
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+        perror("setsockopt failed");
+        exit(EXIT_FAILURE);
+    }
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("bind failed");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Ожидание подключения клиента */
+    if (listen(server_fd, 3) < 0) {
+        perror("listen failed");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Server is listening on port %d\n", PORT);
+
+    if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t *)&addrlen)) < 0) {
+        perror("accept failed");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Чтение сообщения от клиента */
+    read(new_socket, buffer, BUFFER_SIZE);
+    printf("Message from client: %s\n", buffer);
+
+    /* Отправка ответа клиенту */
+    send(new_socket, response, strlen(response), 0);
+    printf("Response sent to client\n");
+
+    close(new_socket);
+    close(server_fd);
+    return 0;
+}
+EOF
+
+========== client.c ==========
+
+cat > client.c << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+
+#define PORT 8080
+#define BUFFER_SIZE 1024
+
+int main(void) {
+    int sock = 0;
+    struct sockaddr_in serv_addr;
+    char *message = "Hello from client";
+    char buffer[BUFFER_SIZE] = {0};
+
+    /* Создание клиентского сокета */
+    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        printf("\n Socket creation error \n");
+        return -1;
+    }
+
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(PORT);
+
+    /* Преобразование адреса IPv4 из текста в двоичный вид */
+    if (inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr) <= 0) {
+        printf("\nInvalid address/ Address not supported \n");
+        return -1;
+    }
+
+    /* Подключение к серверу */
+    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        printf("\nConnection Failed \n");
+        return -1;
+    }
+
+    /* Отправка сообщения серверу */
+    send(sock, message, strlen(message), 0);
+    printf("Message sent to server\n");
+
+    /* Чтение ответа от сервера */
+    read(sock, buffer, BUFFER_SIZE);
+    printf("Response from server: %s\n", buffer);
+
+    close(sock);
+    return 0;
+}
+EOF
+
+========== server_mod.c ==========
+
+cat > server_mod.c << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+#define PORT 8080
+#define BUFFER_SIZE 1024
+#define MAX_FILE 10485760
+
+struct client_ctx {
+    int fd;
+};
+
+static int send_all(int fd, const void *data, size_t len) {
+    const char *p = data;
+    while (len > 0) {
+        ssize_t n = send(fd, p, len, 0);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        p += n;
+        len -= (size_t) n;
+    }
+    return 0;
+}
+
+static int read_line(int fd, char *buf, size_t cap) {
+    size_t i = 0;
+    while (i + 1 < cap) {
+        char c;
+        ssize_t n = read(fd, &c, 1);
+        if (n == 0)
+            break;
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        buf[i++] = c;
+        if (c == '\n')
+            break;
+    }
+    buf[i] = '\0';
+    return (int) i;
+}
+
+static int read_n(int fd, char *buf, size_t len) {
+    size_t got = 0;
+    while (got < len) {
+        ssize_t n = read(fd, buf + got, len - got);
+        if (n == 0)
+            return -1;
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        got += (size_t) n;
+    }
+    return 0;
+}
+
+static void save_file(int fd, char *line) {
+    char name[256];
+    long size = -1;
+
+    if (sscanf(line, "FILE %255s %ld", name, &size) != 2 ||
+        strchr(name, '/') != NULL || strstr(name, "..") != NULL ||
+        size < 0 || size > MAX_FILE) {
+        send_all(fd, "Rejected\n", 9);
+        return;
+    }
+
+    char path[300];
+    snprintf(path, sizeof path, "recv_%s", name);
+
+    FILE *out = fopen(path, "wb");
+    if (out == NULL) {
+        perror("fopen");
+        send_all(fd, "Save failed\n", 12);
+        return;
+    }
+
+    char buf[4096];
+    long left = size;
+    while (left > 0) {
+        size_t chunk = (size_t) left;
+        if (chunk > sizeof buf)
+            chunk = sizeof buf;
+        if (read_n(fd, buf, chunk) != 0) {
+            fclose(out);
+            send_all(fd, "Short file\n", 11);
+            return;
+        }
+        fwrite(buf, 1, chunk, out);
+        left -= (long) chunk;
+    }
+    fclose(out);
+
+    char msg[320];
+    snprintf(msg, sizeof msg, "File saved: %s (%ld bytes)\n", path, size);
+    send_all(fd, msg, strlen(msg));
+    printf("%s", msg);
+}
+
+static void *client_thread(void *arg) {
+    struct client_ctx *ctx = arg;
+    int fd = ctx->fd;
+    free(ctx);
+
+    char line[BUFFER_SIZE];
+    for (;;) {
+        int n = read_line(fd, line, sizeof line);
+        if (n <= 0)
+            break;
+        if (strncmp(line, "FILE ", 5) == 0) {
+            save_file(fd, line);
+            continue;
+        }
+        printf("Message from client: %s", line);
+        char response[BUFFER_SIZE + 32];
+        snprintf(response, sizeof response, "Echo: %s", line);
+        if (send_all(fd, response, strlen(response)) != 0)
+            break;
+        if (strncmp(line, "exit", 4) == 0)
+            break;
+    }
+
+    close(fd);
+    return NULL;
+}
+
+int main(void) {
+    int server_fd = socket(AF_INET6, SOCK_STREAM, 0);
+    int ipv6 = 1;
+    if (server_fd < 0) {
+        perror("IPv6 socket недоступен, используется IPv4");
+        ipv6 = 0;
+        server_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_fd < 0) {
+            perror("socket failed");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    int opt = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof opt) < 0) {
+        perror("setsockopt failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (ipv6) {
+        int off = 0;
+        if (setsockopt(server_fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof off) < 0) {
+            perror("IPV6_V6ONLY");
+            exit(EXIT_FAILURE);
+        }
+        struct sockaddr_in6 address;
+        memset(&address, 0, sizeof address);
+        address.sin6_family = AF_INET6;
+        address.sin6_addr = in6addr_any;
+        address.sin6_port = htons(PORT);
+        if (bind(server_fd, (struct sockaddr *) &address, sizeof address) < 0) {
+            perror("bind failed");
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        struct sockaddr_in address;
+        memset(&address, 0, sizeof address);
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_ANY);
+        address.sin_port = htons(PORT);
+        if (bind(server_fd, (struct sockaddr *) &address, sizeof address) < 0) {
+            perror("bind failed");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    if (listen(server_fd, 16) < 0) {
+        perror("listen failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (ipv6)
+        printf("Server is listening on port %d (IPv6 and IPv4)\n", PORT);
+    else
+        printf("Server is listening on port %d (IPv4 only)\n", PORT);
+
+    for (;;) {
+        struct sockaddr_storage client;
+        socklen_t len = sizeof client;
+        int fd = accept(server_fd, (struct sockaddr *) &client, &len);
+        if (fd < 0) {
+            perror("accept failed");
+            continue;
+        }
+
+        char host[INET6_ADDRSTRLEN];
+        if (client.ss_family == AF_INET6) {
+            struct sockaddr_in6 *a = (struct sockaddr_in6 *) &client;
+            inet_ntop(AF_INET6, &a->sin6_addr, host, sizeof host);
+        } else {
+            struct sockaddr_in *a = (struct sockaddr_in *) &client;
+            inet_ntop(AF_INET, &a->sin_addr, host, sizeof host);
+        }
+        printf("Client connected: %s\n", host);
+
+        struct client_ctx *ctx = malloc(sizeof *ctx);
+        if (ctx == NULL) {
+            perror("malloc");
+            close(fd);
+            continue;
+        }
+        ctx->fd = fd;
+
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, client_thread, ctx) != 0) {
+            perror("pthread_create");
+            close(fd);
+            free(ctx);
+            continue;
+        }
+        pthread_detach(tid);
+    }
+}
+EOF
+
+========== client_mod.c ==========
+
+cat > client_mod.c << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/socket.h>
+
+#define PORT "8080"
+#define MAX_FILE 10485760
+
+static int send_all(int fd, const void *data, size_t len) {
+    const char *p = data;
+    while (len > 0) {
+        ssize_t n = send(fd, p, len, 0);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        p += n;
+        len -= (size_t) n;
+    }
+    return 0;
+}
+
+static int connect_to(const char *host, const char *port) {
+    struct addrinfo hints;
+    struct addrinfo *res = NULL;
+    struct addrinfo *rp;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    int rc = getaddrinfo(host, port, &hints, &res);
+    if (rc != 0) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rc));
+        return -1;
+    }
+
+    int sock = -1;
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sock < 0)
+            continue;
+        if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0)
+            break;
+        close(sock);
+        sock = -1;
+    }
+    freeaddrinfo(res);
+
+    if (sock < 0) {
+        perror("Connection Failed");
+        return -1;
+    }
+    return sock;
+}
+
+static int send_file(int sock, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        perror(path);
+        return -1;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        perror("fseek");
+        fclose(f);
+        return -1;
+    }
+    long size = ftell(f);
+    if (size < 0 || size > MAX_FILE) {
+        fprintf(stderr, "Плохой размер файла\n");
+        fclose(f);
+        return -1;
+    }
+    rewind(f);
+
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+
+    char header[512];
+    int hlen = snprintf(header, sizeof header, "FILE %s %ld\n", base, size);
+    if (hlen < 0 || send_all(sock, header, (size_t) hlen) != 0) {
+        perror("send");
+        fclose(f);
+        return -1;
+    }
+
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) {
+        if (send_all(sock, buf, n) != 0) {
+            perror("send");
+            fclose(f);
+            return -1;
+        }
+    }
+    fclose(f);
+
+    char resp[512];
+    int rn = read(sock, resp, sizeof resp - 1);
+    if (rn < 0) {
+        perror("read");
+        return -1;
+    }
+    if (rn == 0) {
+        printf("Сервер закрыл соединение\n");
+        return -1;
+    }
+    resp[rn] = '\0';
+    printf("%s", resp);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    const char *host = "127.0.0.1";
+    const char *file = NULL;
+
+    if (argc >= 2)
+        host = argv[1];
+    if (argc == 4 && strcmp(argv[2], "--file") == 0)
+        file = argv[3];
+    else if (argc != 1 && argc != 2) {
+        fprintf(stderr, "Использование: %s [адрес] [--file путь]\n", argv[0]);
+        return 1;
+    }
+
+    int sock = connect_to(host, PORT);
+    if (sock < 0)
+        return 1;
+
+    printf("Connected to %s port %s\n", host, PORT);
+
+    if (file != NULL) {
+        int rc = send_file(sock, file);
+        close(sock);
+        return rc == 0 ? 0 : 1;
+    }
+
+    printf("Введите строки. exit завершает сеанс.\n");
+    char line[1024];
+    while (fgets(line, sizeof line, stdin) != NULL) {
+        if (send_all(sock, line, strlen(line)) != 0) {
+            perror("send");
+            break;
+        }
+        if (strncmp(line, "exit", 4) == 0)
+            break;
+        char resp[2048];
+        int n = read(sock, resp, sizeof resp - 1);
+        if (n <= 0) {
+            printf("Сервер закрыл соединение\n");
+            break;
+        }
+        resp[n] = '\0';
+        printf("%s", resp);
+    }
+
+    close(sock);
+    return 0;
+}
+EOF
+
+========== сборка ==========
+
+gcc -o server server.c -lpthread
+gcc -o client client.c
+gcc -o server_mod server_mod.c -lpthread
+gcc -o client_mod client_mod.c
+
+========== проверка server и client ==========
+
+# терминал 1
+./server
+
+# терминал 2
+./client
+
+# ошибка, когда сервера нет: сначала закрой сервер, потом
+./client
+
+========== проверка server_mod и client_mod ==========
+
+# терминал 1
+./server_mod
+
+# терминал 2, несколько сообщений. Последняя строка — exit
+./client_mod 127.0.0.1
+
+# терминал 3, второй клиент, пока первый ещё не ввёл exit
+./client_mod ::1
+
+# файл
+echo 'praktika 15' > note.txt
+./client_mod 127.0.0.1 --file note.txt
+cat recv_note.txt
+
+# сервер останавливается Ctrl+C в его терминале
